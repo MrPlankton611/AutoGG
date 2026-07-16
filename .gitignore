@@ -10,8 +10,21 @@ out/
 *.swo
 .DS_Store
 Thumbs.db
+desktop.ini
 *.iml
 *.ipr
 *.iws
 local.properties
-!.gitignore
+
+# IntelliJ
+.idea_modules/
+
+# Fabric Loom run configs
+run/
+
+# Local JDK / downloaded toolchains
+jdk-21/
+
+# Misc
+*.orig
+*.rej
