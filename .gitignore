@@ -1,0 +1,17 @@
+.gradle
+.idea
+build/
+out/
+*.jar
+*.class
+*.log
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.iml
+*.ipr
+*.iws
+local.properties
+!.gitignore
