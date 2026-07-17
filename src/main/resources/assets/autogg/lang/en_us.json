@@ -1,12 +1,3 @@
 {
-    "itemGroup.autogg": "AutoGG",
-    "key.autogg.open_config": "Open AutoGG Config",
-    "screen.autogg.title": "AutoGG Config",
-    "screen.autogg.triggers": "Triggers (comma-separated)",
-    "screen.autogg.response": "Response message",
-    "screen.autogg.cooldown": "Cooldown (ms)",
-    "screen.autogg.triggers_label": "Triggers (comma-separated):",
-    "screen.autogg.response_label": "Response message:",
-    "screen.autogg.cooldown_label": "Cooldown (ms):",
-    "screen.autogg.hint": "Changes save automatically when you close this screen."
+    "itemGroup.autogg": "AutoGG"
 }

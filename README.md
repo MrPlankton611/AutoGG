@@ -1,9 +1,12 @@
 # AutoGG
 
 A small **Fabric** mod for **Minecraft 1.21.11** that watches the chat HUD on
-multiplayer servers, matches configurable trigger substrings (default: trophy
-`🏆`, `Winner(s):`, `Match Report`, etc.), and sends a configurable response
-(default `gg`) once per cooldown window when a match ends.
+multiplayer servers. When a chat line contains any of a hardcoded set of
+trigger substrings (trophy `🏆`, `Winner(s):`, `Match Report`, etc.), the
+mod sends `gg` once per cooldown window and stops.
+
+That's the whole mod. There is no config file, no in-game menu, no keybind,
+and no settings UI — it only cares about the chat log.
 
 - Mod id: `autogg`
 - Version: `1.0.0`
@@ -15,64 +18,51 @@ multiplayer servers, matches configurable trigger substrings (default: trophy
 
 ## Install (player)
 
-1. Build (see below) or grab `build/libs/autogg-1.0.0.jar`.
+1. Build (see *Build from source*) or grab `build/libs/autogg-1.0.0.jar`.
 2. Copy it into your Minecraft `mods/` folder
    (Windows: `%AppData%\.minecraft\mods\`).
 3. Launch Minecraft 1.21.11 with Fabric Loader 0.19.3 (or newer 0.16.9+) and
    Fabric API installed.
-4. The mod creates `config/autogg.properties` on first run with sensible
-   defaults so nothing else needs to be done.
+4. That's it — the mod is active on any multiplayer server.
 
 The mod only acts on multiplayer servers. Singleplayer is excluded by design.
 
-## Configure
+## What it watches for
 
-The config file lives at `<gameDir>/config/autogg.properties`. It is created
-on first launch with the defaults below.
+A new chat line is matched (case-insensitive substring) against:
 
-```properties
-# Comma-separated substring patterns. A chat line matches (case-insensitive
-# substring search) if it contains any of these tokens.
-triggers=🏆,Winner(s):,First to:,Match Report,Match Log,Game Log,Match Summary,Game Over!
-
-# Chat message the mod sends when a trigger fires.
-response=gg
-
-# Minimum milliseconds between sends — prevents spam if multiple triggers
-# hit the same line or two server messages land within a tick.
-cooldownMs=5000
+```
+🏆
+Winner(s):
+First to:
+Match Report
+Match Log
+Game Log
+Match Summary
+Game Over!
 ```
 
-Lines beginning with `#` are comments. Blank lines are ignored. Bad numeric
-values for `cooldownMs` fall back to the default (5000).
+If any trigger matches, the mod sends `gg` through the player's network
+handler and waits 5 seconds before being willing to send again (so a
+multi-line match summary doesn't fire `gg` five times in a row).
 
-### Configure in-game
+To change the triggers or the response message, edit the `TRIGGERS` and
+`RESPONSE` constants in `AutoGGMod.java` and rebuild.
 
-Press **F8** (default keybind) to open the AutoGG config screen from anywhere
-in the client — main menu, singleplayer, options screen, or in-game. The
-screen has three fields:
+## How the chat HUD is read
 
-- **Triggers** — comma-separated substring patterns (same format as the file).
-- **Response** — the chat message the mod sends when a trigger fires.
-- **Cooldown (ms)** — minimum milliseconds between sends.
+`AutoGGMod.findMessagesList` walks `ChatHud.getClass().getDeclaredFields()` on
+every tick and picks the first non-static `List<?>` whose first non-null
+element is **not** a `java.lang.String`. The `String`-filter is essential:
+vanilla 1.21.11 `ChatHud` carries a typed-message history list
+(used for up-arrow recall of past `/msg` and commands) whose elements are
+`String`. Without the filter the reflection deterministically picks that
+list — `MATCH REPORT` lines never appear in it, so the mod would never fire.
 
-Changes save automatically when you close the screen (Done button or ESC)
-and are written back to `<gameDir>/config/autogg.properties` immediately, so
-you can also edit the file by hand and pick up the new values on the next
-screen-open / restart. The keybind can be remapped in **Options → Controls**
-under the **Misc** category.
-
-### How matching works
-
-- A `ChatHudLine` reference is added to the in-memory identity set the
-  **first** time the chat HUD displays it.
-- On later ticks, lines whose identity is not yet in the set are scanned.
-- Each scanned line is checked against all `triggers` via
-  `String.contains(..., Locale.ROOT)` (so `Winner(s):` matches regardless of
-  case).
-- The first matching trigger fires `response` through the player's network
-  handler. The cooldown timer starts at that moment.
-- A 5-second default cooldown prevents stacking on multi-line match summaries.
+The mod keeps an identity-based set of `ChatHudLine` references it has
+already processed so that previously-seen lines aren't re-scanned and
+re-fired every tick. The set is trimmed every tick to the currently
+visible chat window so it doesn't grow without bound over a long session.
 
 ### Self-echo suppression
 
@@ -111,29 +101,13 @@ distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.4-bin.zip
 Loom 1.17.14 supports Gradle 8.x cleanly on JDK 21, and the wrapper then
 works without the `CMD_LINE_ARGS` workaround.
 
-## How the chat HUD is read
-
-`AutoGGMod.findMessagesList` walks `ChatHud.getClass().getDeclaredFields()` on
-every tick and picks the first non-static `List<?>` whose first non-null
-element is **not** a `java.lang.String`. The `String`-filter is essential:
-vanilla 1.21.11 `ChatHud` carries a typed-message history list
-(used for up-arrow recall of past `/msg` and commands) whose elements are
-`String`. Without the filter the reflection deterministically picks that
-list — `MATCH REPORT` lines never appear in it, so the mod never fires.
-
-The chat HUD list reference is also cached across ticks; if `ChatHud`
-hands the mod a brand-new list reference (server switch, mod reset,
-backlog replay), the identity set is re-seeded from the new list and no
-trigger fires on the freshly-seen backlog.
-
 ## Troubleshooting
 
-- **Nothing fires on clear match-end lines** — confirm
-  `config/autogg.properties` has the trigger you expect. The default list
-  covers Hypixel-style and lunar-PvP-style match messages.
-- **Triggers fire twice** — lower `cooldownMs` won't help (that's a floor
-  not a ceiling). The self-echo suppression already drops server echoes of
-  your own sends.
+- **Nothing fires on a clear match-end line** — the trigger list is hardcoded
+  in `AutoGGMod.java`. If the server's match message uses a phrase that
+  isn't in the list, no match will fire. Edit the source and rebuild.
+- **Triggers fire twice** — they shouldn't. There's a 5-second cooldown, and
+  the server echo of `gg` is dropped by the self-echo guard.
 - **Build fails with `CMD_LINE_ARGS`** — use the cached Gradle 9.6 direct
   invocation above, or switch the wrapper distributionUrl to
   `gradle-8.10.4-bin.zip` as documented in *Build from source*.
@@ -141,10 +115,10 @@ trigger fires on the freshly-seen backlog.
 ## Project layout
 
 ```
-src/main/java/com/autogg/autogg/AutoGGMod.java   single-file mod, includes the in-game AutoGGConfigScreen
+src/main/java/com/autogg/autogg/AutoGGMod.java   single-file mod
 src/main/resources/
-    assets/autogg/lang/en_us.json                keybinding + config screen strings
-    fabric.mod.json                              mod metadata (main + client entrypoints)
+    assets/autogg/lang/en_us.json                (empty key set, no UI)
+    fabric.mod.json                              mod metadata
 build.gradle                                     Loom build script
 gradle.properties                                pinned MC / Fabric / Java versions
 ```
