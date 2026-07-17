@@ -57,10 +57,6 @@ public class AutoGGMod implements ModInitializer {
     // Rate-limit for the "scanned, no matching trigger" diagnostic so it doesn't spam.
     private long lastScanLogMs = 0L;
     private static final long SCAN_LOG_INTERVAL_MS = 10_000L;
-    // Tick diagnostic: log messages list size + first-element class + first-element
-    // identity hash so we can prove we're watching a list that actually updates.
-    private long lastTickDiagMs = 0L;
-    private static final long TICK_DIAG_INTERVAL_MS = 1000L;
 
     private static boolean visitorClassResolved = false;
     private static Class<?> characterVisitorClass = null;
@@ -80,21 +76,6 @@ public class AutoGGMod implements ModInitializer {
 
                 List<?> messages = findMessagesList(chatHud);
                 if (messages == null) return;
-
-                // Tick diagnostic (max once per second). Tells us whether the picked
-                // list receives new entries: if size doesn't grow and the
-                // identityHashCode of get(0) never changes, we're watching a list
-                // that Lunar is keeping stable while showing chat elsewhere.
-                long diagNow = System.currentTimeMillis();
-                if (diagNow - lastTickDiagMs >= TICK_DIAG_INTERVAL_MS) {
-                    lastTickDiagMs = diagNow;
-                    Object first = messages.isEmpty() ? null : messages.get(0);
-                    System.out.println("[AutoGG-tick] size=" + messages.size()
-                            + " firstClass=" + (first == null ? "null" : first.getClass().getSimpleName())
-                            + " firstIdent=" + (first == null ? "null" : Integer.toHexString(System.identityHashCode(first)))
-                            + " knownRefs=" + knownRefs.size()
-                            + " field=" + LAST_PICKED_FIELD);
-                }
 
                 // World / player change detection: clear all state so the new chat hud
                 // doesn't fire on already-displayed backlog from the previous session.
@@ -229,24 +210,16 @@ public class AutoGGMod implements ModInitializer {
     }
 
     /**
-     * Pick the chat messages list on the runtime ChatHud every tick. Yarn 1.21.11
+     * Pick the chat-hud messages list on the runtime ChatHud every tick. Yarn 1.21.11
      * ChatHud has multiple List fields (`messages`, trimmedMessages, sent-message
      * history) and the underlying reference can be replaced on a server-switch.
-     * Caching a once-picked reference goes stale across server switches and silently
-     * fails to detect new chat after a transfer -- which is what happened in the
-     * log we're debugging. Re-finding each tick is cheap (a handful of field reads)
-     * and removes the staleness class of bugs entirely. getDeclaredFields() order
-     * is stable within a JVM, so the same field is picked consistently across ticks
-     * even without an explicit cache.
+     * getDeclaredFields() order is stable within a JVM, so the same field is picked
+     * consistently across ticks. The most important filter is {@link
+     * #isLikelyStringHistory}: without it the reflection deterministically picks
+     * the typed-message history list (whose elements are {@code String}), which never
+     * contains MATCH REPORT lines and so the mod would never trigger.
      */
-    // The picked List<?> reference, exposed so the tick diagnostic can name the
-    // field we're watching (e.g. "messages", "trimmedMessages", "queue").
-    private static volatile List<?> LAST_PICKED_LIST = null;
-    private static volatile String LAST_PICKED_FIELD = "(none)";
-
     private static List<?> findMessagesList(ChatHud chatHud) {
-        LAST_PICKED_FIELD = "(none)";
-        LAST_PICKED_LIST = null;
         try {
             for (Field f : chatHud.getClass().getDeclaredFields()) {
                 if (Modifier.isStatic(f.getModifiers())) continue;
@@ -255,19 +228,11 @@ public class AutoGGMod implements ModInitializer {
                 Object v = f.get(chatHud);
                 if (!(v instanceof List<?>)) continue;
                 List<?> list = (List<?>) v;
-                // Skip typed-message history (List<String> of past /msg and chat
-                // lines used by up-arrow recall). It's a List, it has non-empty
-                // elements, but its contents are NEVER the displayed chat, so
-                // picking it means we can never see a "MATCH REPORT" trigger.
                 if (isLikelyStringHistory(list)) continue;
                 for (Object element : list) {
                     if (element == null) continue;
                     String s = extractText(element);
-                    if (!s.isEmpty()) {
-                        LAST_PICKED_LIST = list;
-                        LAST_PICKED_FIELD = f.getName();
-                        return list;
-                    }
+                    if (!s.isEmpty()) return list;
                 }
             }
         } catch (Throwable ignored) {
@@ -277,27 +242,19 @@ public class AutoGGMod implements ModInitializer {
     }
 
     /**
-     * Cheap heuristic: skip lists whose element type is java.lang.String. That
-     * excludes the typed-message history list (and any other accidental List that
-     * happens to be present on the ChatHud reflection scan). The chat-display lists
-     * (vanilla `messages`, `trimmedMessages`) hold ChatHudLine / MessagePair records
-     * with a real `content()` method -- the path that gets chosen below.
+     * Skip lists whose first non-null element is a {@code String}. Vanilla 1.21.11
+     * ChatHud has a typed-message history list (the up-arrow recall buffer) holding
+     * {@code String} entries. If we pick it, no MATCH REPORT line will ever pass
+     * through {@link #extractText} triggers, so we treat String-typed lists as the
+     * history list and look further. Empty lists are not flagged here so a freshly-
+     * primed chat can still resolve to a chat-display list that just happens to be
+     * empty at that moment.
      */
     private static boolean isLikelyStringHistory(List<?> list) {
-        if (list.isEmpty()) {
-            // Empty typed-history can also float around; treat ANY list whose first
-            // survivor (we don't want to probe Slot-0 once at high cost) looks
-            // String-ish by generic-supertype scan as not-the-chat. We only have
-            // access to element instances here; if a list is empty we'll fall back
-            // to letting it through so a freshly-primed chat still resolves.
-            return false;
-        }
+        if (list.isEmpty()) return false;
         for (Object element : list) {
             if (element == null) continue;
-            if (element.getClass() == String.class) return true;
-            // Stop after first non-null element; if it's not a String, the list is
-            // probably a chat-display list.
-            return false;
+            return element.getClass() == String.class;
         }
         return false;
     }
