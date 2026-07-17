@@ -18,11 +18,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 public class AutoGGMod implements ModInitializer {
     public static final String MOD_ID = "autogg";
 
-    private static final List<String> DEFAULT_TRIGGERS = List.of("\uD83C\uDFC6", "Winner(s):", "First to:");
+    private static final List<String> DEFAULT_TRIGGERS = List.of("\uD83C\uDFC6", "Winner(s):", "First to:", "Match Report", "Match Log", "Game Log", "Match Summary", "Game Over!");
     private static final String DEFAULT_RESPONSE = "gg";
     private static final long DEFAULT_COOLDOWN_MS = 5000L;
 
@@ -80,8 +81,9 @@ public class AutoGGMod implements ModInitializer {
                         continue;
                     }
 
+                    String lowerText = text.toLowerCase(Locale.ROOT);
                     for (String trig : triggers) {
-                        if (text.contains(trig)) {
+                        if (lowerText.contains(trig.toLowerCase(Locale.ROOT))) {
                             long now = System.currentTimeMillis();
                             if (now - lastFireTime >= cooldownMs) {
                                 sendChat(mc, responseMessage);
@@ -256,7 +258,7 @@ public class AutoGGMod implements ModInitializer {
                     w.write("# AutoGG configuration\n");
                     w.write("# Comma-separated substring patterns. A chat line matches if it contains\n");
                     w.write("# any of these (case-sensitive substring search).\n");
-                    w.write("triggers=\uD83C\uDFC6,Winner(s):,First to:\n");
+                    w.write("triggers=\uD83C\uDFC6,Winner(s):,First to:,Match Report,Match Log,Game Log,Match Summary,Game Over!\n");
                     w.write("# Message the mod sends in chat when a trigger fires.\n");
                     w.write("response=gg\n");
                     w.write("# Minimum milliseconds between sends to avoid spam.\n");
