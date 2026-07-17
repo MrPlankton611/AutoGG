@@ -1,11 +1,21 @@
 package com.autogg.autogg;
 
+import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.hud.ChatHud;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.text.Text;
+import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -23,14 +33,14 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.UUID;
 
-public class AutoGGMod implements ModInitializer {
+public class AutoGGMod implements ModInitializer, ClientModInitializer {
     public static final String MOD_ID = "autogg";
 
     private static final List<String> DEFAULT_TRIGGERS = List.of("\uD83C\uDFC6", "Winner(s):", "First to:", "Match Report", "Match Log", "Game Log", "Match Summary", "Game Over!");
     private static final String DEFAULT_RESPONSE = "gg";
     private static final long DEFAULT_COOLDOWN_MS = 5000L;
 
-    private List<String> triggers = DEFAULT_TRIGGERS;
+    private List<String> triggers = new ArrayList<>(DEFAULT_TRIGGERS);
     private String responseMessage = DEFAULT_RESPONSE;
     private long cooldownMs = DEFAULT_COOLDOWN_MS;
 
@@ -58,8 +68,16 @@ public class AutoGGMod implements ModInitializer {
     private long lastScanLogMs = 0L;
     private static final long SCAN_LOG_INTERVAL_MS = 10_000L;
 
+    // Cached on first load/persist so we always write to the same file we read.
+    private Path configFilePath = null;
+
+    // Yarn 1.21.11 changed KeyBinding's category param from String to
+    // net.minecraft.client.option.KeyBinding.Category. MISC is a vanilla
+    // predefined KeyBinding.Category that groups miscellaneous mod controls.
     private static boolean visitorClassResolved = false;
     private static Class<?> characterVisitorClass = null;
+
+    private KeyBinding openConfigKey;
 
     @Override
     public void onInitialize() {
@@ -201,6 +219,28 @@ public class AutoGGMod implements ModInitializer {
         });
     }
 
+    @Override
+    public void onInitializeClient() {
+        // Default keybind F8. Avoiding movement keys (W/A/S/D), common chat
+        // keys (T/Enter), inventory (E), and tab (Tab). Easily rebound in
+        // Options -> Controls under the MISC category.
+        openConfigKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.autogg.open_config",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_F8,
+                KeyBinding.Category.MISC
+        ));
+        // END_CLIENT_TICK runs every client tick, including on the title/menu
+        // screen, so the user can rebind or open the config from anywhere.
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (openConfigKey == null) return;
+            // Drain repeats so a long press doesn't open the screen over and over.
+            while (openConfigKey.wasPressed()) {
+                client.setScreen(new AutoGGConfigScreen(client.currentScreen));
+            }
+        });
+    }
+
     private boolean isOurEcho(String text) {
         if (lastSentText.isEmpty()) return false;
         String trimmed = text.trim();
@@ -336,13 +376,7 @@ public class AutoGGMod implements ModInitializer {
     }
 
     private void loadConfig() {
-        File cfg;
-        try {
-            Path gameDir = FabricLoader.getInstance().getGameDir();
-            cfg = gameDir.resolve("config").resolve("autogg.properties").toFile();
-        } catch (Throwable t) {
-            cfg = new File("./config/autogg.properties");
-        }
+        File cfg = resolveConfigFile();
         try {
             if (cfg.exists()) {
                 List<String> parsedTriggers = new ArrayList<>(DEFAULT_TRIGGERS);
@@ -367,27 +401,178 @@ public class AutoGGMod implements ModInitializer {
                         try { parsedCooldown = Long.parseLong(val); } catch (NumberFormatException nfe) { /* keep default */ }
                     }
                 }
-                triggers = Collections.unmodifiableList(parsedTriggers);
+                triggers = parsedTriggers;
                 responseMessage = parsedResponse;
                 cooldownMs = parsedCooldown;
             } else {
-                File parent = cfg.getParentFile();
-                if (parent != null && !parent.exists()) parent.mkdirs();
-                try (FileWriter w = new FileWriter(cfg)) {
-                    w.write("# AutoGG configuration\n");
-                    w.write("# Comma-separated substring patterns. A chat line matches if it contains\n");
-                    w.write("# any of these (case-sensitive substring search).\n");
-                    w.write("triggers=\uD83C\uDFC6,Winner(s):,First to:,Match Report,Match Log,Game Log,Match Summary,Game Over!\n");
-                    w.write("# Message the mod sends in chat when a trigger fires.\n");
-                    w.write("response=gg\n");
-                    w.write("# Minimum milliseconds between sends to avoid spam.\n");
-                    w.write("cooldownMs=5000\n");
-                }
+                // First run: write the default file so a user can find/edit it later.
+                persistConfig();
             }
         } catch (Throwable t) {
             System.out.println("[AutoGG] config load failed: " + t);
         }
         System.out.println("[AutoGG] config loaded: triggers=" + triggers
                 + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms, file=" + cfg.getAbsolutePath());
+    }
+
+    /** Writes the current in-memory config to {@link #configFilePath}, creating parent
+     *  dirs and a brand-new file with comments + keys if either is missing. Safe to
+     *  call from the client thread (where the keybinding tick handler and screen
+     *  close path run) because there is no concurrent writer: only this method
+     *  mutates the file, and it's idempotent. */
+    private void persistConfig() {
+        if (configFilePath == null) {
+            configFilePath = resolveConfigFile().toPath();
+        }
+        try {
+            File cfg = configFilePath.toFile();
+            File parent = cfg.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            try (FileWriter w = new FileWriter(cfg)) {
+                w.write("# AutoGG configuration\n");
+                w.write("# Edit in-game via the AutoGG config screen (default key: G),\n");
+                w.write("# or here and restart / close + reopen the screen to apply.\n");
+                w.write("# Comma-separated substring patterns. A chat line matches if it contains\n");
+                w.write("# any of these (case-insensitive substring search).\n");
+                w.write("triggers=" + String.join(",", triggers) + "\n");
+                w.write("# Message the mod sends in chat when a trigger fires.\n");
+                w.write("response=" + responseMessage + "\n");
+                w.write("# Minimum milliseconds between sends to avoid spam.\n");
+                w.write("cooldownMs=" + cooldownMs + "\n");
+            }
+        } catch (Throwable t) {
+            System.out.println("[AutoGG] config save failed: " + t);
+        }
+    }
+
+    private File resolveConfigFile() {
+        try {
+            Path gameDir = FabricLoader.getInstance().getGameDir();
+            return gameDir.resolve("config").resolve("autogg.properties").toFile();
+        } catch (Throwable t) {
+            return new File("./config/autogg.properties");
+        }
+    }
+
+    /** Parse the raw text-field contents, replace in-memory config, persist to disk.
+     *  Robust to bad input — fields fall back to defaults rather than throwing. */
+    void applyConfigFromText(String triggersText, String responseText, String cooldownText) {
+        List<String> parsed = new ArrayList<>();
+        if (triggersText != null) {
+            for (String t : triggersText.split(",")) {
+                String tt = t.trim();
+                if (!tt.isEmpty()) parsed.add(tt);
+            }
+        }
+        if (parsed.isEmpty()) parsed.addAll(DEFAULT_TRIGGERS);
+
+        long cd = DEFAULT_COOLDOWN_MS;
+        if (cooldownText != null) {
+            String trimmed = cooldownText.trim();
+            if (!trimmed.isEmpty()) {
+                try { cd = Long.parseLong(trimmed); } catch (NumberFormatException nfe) { /* keep default */ }
+            }
+        }
+        if (cd < 0) cd = 0L;
+
+        triggers = parsed;
+        responseMessage = (responseText == null || responseText.isEmpty()) ? DEFAULT_RESPONSE : responseText;
+        cooldownMs = cd;
+        // Reset self-echo guard: the previous response (e.g. "gg") shouldn't suppress
+        // a chat line because the user just changed responseMessage.
+        lastSentText = "";
+        persistConfig();
+        System.out.println("[AutoGG] config updated via GUI: triggers=" + triggers
+                + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms");
+    }
+
+    /** Vanilla screen that lets the user edit triggers / response / cooldown from
+     *  in-game and writes the result back to the config file. Always saves on ESC
+     *  and on Done; partial edits are fine because applyConfigFromText parses + falls
+     *  back to defaults per-field. The parent screen is whatever was active when the
+     *  keybinding was pressed (e.g. title screen, options screen, in-game HUD). */
+    class AutoGGConfigScreen extends Screen {
+        private final Screen parentScreen;
+        private TextFieldWidget triggersField;
+        private TextFieldWidget responseField;
+        private TextFieldWidget cooldownField;
+
+        AutoGGConfigScreen(Screen parent) {
+            super(Text.translatable("screen.autogg.title"));
+            this.parentScreen = parent;
+        }
+
+        @Override
+        protected void init() {
+            super.init();
+            int cx = this.width / 2;
+
+            triggersField = new TextFieldWidget(
+                    this.textRenderer, cx - 200, 60, 400, 20,
+                    Text.translatable("screen.autogg.triggers"));
+            triggersField.setMaxLength(1000);
+            triggersField.setText(String.join(",", AutoGGMod.this.triggers));
+            this.addDrawableChild(triggersField);
+
+            responseField = new TextFieldWidget(
+                    this.textRenderer, cx - 200, 110, 400, 20,
+                    Text.translatable("screen.autogg.response"));
+            responseField.setMaxLength(256);
+            responseField.setText(AutoGGMod.this.responseMessage);
+            this.addDrawableChild(responseField);
+
+            cooldownField = new TextFieldWidget(
+                    this.textRenderer, cx - 60, 160, 120, 20,
+                    Text.translatable("screen.autogg.cooldown"));
+            cooldownField.setMaxLength(12);
+            cooldownField.setText(String.valueOf(AutoGGMod.this.cooldownMs));
+            this.addDrawableChild(cooldownField);
+
+            this.addDrawableChild(ButtonWidget.builder(
+                    Text.translatable("gui.done"),
+                    btn -> saveFromFieldsAndClose())
+                    .dimensions(cx - 100, 210, 200, 20)
+                    .build());
+        }
+
+        private void saveFromFieldsAndClose() {
+            saveFromFields();
+            if (this.client != null) {
+                this.client.setScreen(this.parentScreen);
+            }
+        }
+
+        private void saveFromFields() {
+            AutoGGMod.this.applyConfigFromText(
+                    triggersField == null ? "" : triggersField.getText(),
+                    responseField == null ? "" : responseField.getText(),
+                    cooldownField == null ? "" : cooldownField.getText());
+        }
+
+        @Override
+        public void close() {
+            // Save even if the user presses ESC; otherwise closing without saving would
+            // silently discard the changes. Then return to whatever screen was active.
+            saveFromFields();
+            if (this.client != null) {
+                this.client.setScreen(this.parentScreen);
+            }
+        }
+
+        @Override
+        public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+            this.renderBackground(context, mouseX, mouseY, delta);
+            int cx = this.width / 2;
+            context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, 15, 0xFFFFFFFF);
+            context.drawTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.triggers_label"), cx - 200, 42, 0xFFA0A0A0);
+            context.drawTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.response_label"), cx - 200, 92, 0xFFA0A0A0);
+            context.drawTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.cooldown_label"), cx - 200, 142, 0xFFA0A0A0);
+            context.drawCenteredTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.hint"), cx, 250, 0xFF808080);
+            super.render(context, mouseX, mouseY, delta);
+        }
     }
 }

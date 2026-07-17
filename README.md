@@ -28,7 +28,7 @@ The mod only acts on multiplayer servers. Singleplayer is excluded by design.
 ## Configure
 
 The config file lives at `<gameDir>/config/autogg.properties`. It is created
-on first launch with the defaults below; edit it and relaunch to apply.
+on first launch with the defaults below.
 
 ```properties
 # Comma-separated substring patterns. A chat line matches (case-insensitive
@@ -45,6 +45,22 @@ cooldownMs=5000
 
 Lines beginning with `#` are comments. Blank lines are ignored. Bad numeric
 values for `cooldownMs` fall back to the default (5000).
+
+### Configure in-game
+
+Press **F8** (default keybind) to open the AutoGG config screen from anywhere
+in the client — main menu, singleplayer, options screen, or in-game. The
+screen has three fields:
+
+- **Triggers** — comma-separated substring patterns (same format as the file).
+- **Response** — the chat message the mod sends when a trigger fires.
+- **Cooldown (ms)** — minimum milliseconds between sends.
+
+Changes save automatically when you close the screen (Done button or ESC)
+and are written back to `<gameDir>/config/autogg.properties` immediately, so
+you can also edit the file by hand and pick up the new values on the next
+screen-open / restart. The keybind can be remapped in **Options → Controls**
+under the **Misc** category.
 
 ### How matching works
 
@@ -125,10 +141,10 @@ trigger fires on the freshly-seen backlog.
 ## Project layout
 
 ```
-src/main/java/com/autogg/autogg/AutoGGMod.java   single-file mod
+src/main/java/com/autogg/autogg/AutoGGMod.java   single-file mod, includes the in-game AutoGGConfigScreen
 src/main/resources/
-    assets/autogg/lang/en_us.json                (empty key set, no UI)
-    fabric.mod.json                              mod metadata
+    assets/autogg/lang/en_us.json                keybinding + config screen strings
+    fabric.mod.json                              mod metadata (main + client entrypoints)
 build.gradle                                     Loom build script
 gradle.properties                                pinned MC / Fabric / Java versions
 ```

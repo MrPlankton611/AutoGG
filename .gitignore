@@ -28,3 +28,4 @@ jdk-21/
 # Misc
 *.orig
 *.rej
+nul
