@@ -341,7 +341,17 @@ public class AutoGGMod implements ModInitializer, ClientModInitializer {
 
         @Override
         public void render(DrawContext context, int mouseX, int mouseY, float delta) {
-            this.renderBackground(context, mouseX, mouseY, delta);
+            // In Yarn 1.21.x the superclass render path paints the background
+            // blur AND iterates the drawables list in its own pass. If we draw
+            // labels / call renderBackground first and call super.render LAST,
+            // super.render's pass overwrites our labels and (because of how it
+            // resets the draw context state) the children don't appear
+            // alongside them — the symptom is "blur with no UI elements".
+            //
+            // The fix is to let super.render paint the background AND the
+            // children first, then draw our labels (title + field captions +
+            // hint) on top in the same frame.
+            super.render(context, mouseX, mouseY, delta);
             int cx = this.width / 2;
             context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, 15, 0xFFFFFFFF);
             context.drawTextWithShadow(this.textRenderer,
@@ -352,7 +362,6 @@ public class AutoGGMod implements ModInitializer, ClientModInitializer {
                     Text.translatable("screen.autogg.cooldown_label"), cx - 200, 142, 0xFFA0A0A0);
             context.drawCenteredTextWithShadow(this.textRenderer,
                     Text.translatable("screen.autogg.hint"), cx, 250, 0xFF808080);
-            super.render(context, mouseX, mouseY, delta);
         }
     }
 
