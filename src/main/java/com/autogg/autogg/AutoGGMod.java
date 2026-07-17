@@ -19,11 +19,11 @@ import net.minecraft.text.Text;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
-import java.io.FileWriter;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -168,7 +168,10 @@ public class AutoGGMod implements ModInitializer, ClientModInitializer {
                 List<String> parsedTriggers = new ArrayList<>(DEFAULT_TRIGGERS);
                 String parsedResponse = DEFAULT_RESPONSE;
                 long parsedCooldown = DEFAULT_COOLDOWN_MS;
-                for (String raw : Files.readAllLines(cfg.toPath())) {
+                // Read as UTF-8 explicitly so the default trophy emoji (and
+                // any user-entered Unicode) survives on platforms whose
+                // platform-default charset is not UTF-8 (e.g. Windows).
+                for (String raw : Files.readAllLines(cfg.toPath(), StandardCharsets.UTF_8)) {
                     String l = raw.trim();
                     if (l.isEmpty() || l.startsWith("#")) continue;
                     int eq = l.indexOf('=');
@@ -209,10 +212,12 @@ public class AutoGGMod implements ModInitializer, ClientModInitializer {
             File cfg = configFilePath.toFile();
             File parent = cfg.getParentFile();
             if (parent != null && !parent.exists()) parent.mkdirs();
-            try (FileWriter w = new FileWriter(cfg)) {
+            // Write as UTF-8 explicitly so Unicode (e.g. trophy emoji) survives
+            // round-trips on platforms whose default charset is not UTF-8.
+            try (java.io.Writer w = Files.newBufferedWriter(cfg.toPath(), StandardCharsets.UTF_8)) {
                 w.write("# AutoGG configuration\n");
-                w.write("# Edit in-game via the AutoGG config screen (default key: F8),\n");
-                w.write("# or here and restart / close + reopen the screen to apply.\n");
+                w.write("# Edit in-game via the AutoGG config screen (default key: F8).\n");
+                w.write("# Changes are applied immediately and saved when you close the screen.\n");
                 w.write("# Comma-separated substring patterns. A chat line matches if it\n");
                 w.write("# contains any of these (case-insensitive substring search).\n");
                 w.write("triggers=" + String.join(",", triggers) + "\n");
@@ -235,8 +240,20 @@ public class AutoGGMod implements ModInitializer, ClientModInitializer {
         }
     }
 
-    /** Parse the raw text-field contents, replace in-memory config, persist.
-     *  Robust to bad input — fields fall back to defaults rather than throwing. */
+    /** Parse the raw text-field contents, replace in-memory config, and
+     *  persist only if anything actually changed.
+     *
+     *  Robust to bad input. Critically, we DO NOT silently substitute the
+     *  hard-coded {@link #DEFAULT_TRIGGERS} when the triggers field is empty.
+     *  That used to overwrite the user's custom config whenever they opened
+     *  the menu and closed it without edits (e.g. ESC). If the user clears
+     *  the field we instead keep whatever was already in memory; the only
+     *  place defaults are written is the very first run inside
+     *  {@link #loadConfig}.
+     *
+     *  Live-update: the in-memory fields touched here are the same ones read
+     *  by {@link #onTick} every tick, so new triggers take effect immediately
+     *  without a restart. */
     void applyConfigFromText(String triggersText, String responseText, String cooldownText) {
         List<String> parsed = new ArrayList<>();
         if (triggersText != null) {
@@ -245,26 +262,49 @@ public class AutoGGMod implements ModInitializer, ClientModInitializer {
                 if (!tt.isEmpty()) parsed.add(tt);
             }
         }
-        if (parsed.isEmpty()) parsed.addAll(DEFAULT_TRIGGERS);
+        // Empty triggers field -> keep what's already in memory; do NOT reset
+        // to DEFAULT_TRIGGERS. The previous behaviour silently nuked the
+        // user's config for any case where the trimmed field came back empty.
+        final boolean triggersProvided = !parsed.isEmpty();
 
-        long cd = DEFAULT_COOLDOWN_MS;
+        long cd = cooldownMs; // default to current in-memory value, not the global default
         if (cooldownText != null) {
             String trimmed = cooldownText.trim();
             if (!trimmed.isEmpty()) {
-                try { cd = Long.parseLong(trimmed); } catch (NumberFormatException nfe) { /* keep default */ }
+                try {
+                    long parsedCd = Long.parseLong(trimmed);
+                    if (parsedCd < 0) parsedCd = 0L;
+                    cd = parsedCd;
+                } catch (NumberFormatException nfe) { /* keep current */ }
             }
         }
-        if (cd < 0) cd = 0L;
 
-        triggers = parsed;
-        responseMessage = (responseText == null || responseText.isEmpty()) ? DEFAULT_RESPONSE : responseText;
-        cooldownMs = cd;
+        final String newResponse = (responseText == null || responseText.isEmpty())
+                ? responseMessage   // empty -> keep current; do NOT reset to default
+                : responseText;
+
+        final boolean triggersChanged  = triggersProvided && !parsed.equals(triggers);
+        final boolean responseChanged  = !newResponse.equals(responseMessage);
+        final boolean cooldownChanged  = cd != cooldownMs;
+
+        if (triggersChanged)  triggers = parsed;
+        if (responseChanged)  responseMessage = newResponse;
+        if (cooldownChanged)  cooldownMs = cd;
         // Reset transient state so a fresh response/cooldown take full effect.
         lastSentText = "";
         lastFireTime = 0L;
-        persistConfig();
-        System.out.println("[AutoGG] config updated via GUI: triggers=" + triggers
-                + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms");
+
+        if (triggersChanged || responseChanged || cooldownChanged) {
+            persistConfig();
+            System.out.println("[AutoGG] config updated via GUI: triggers=" + triggers
+                    + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms");
+        } else {
+            // Nothing changed -> skip the disk write entirely so opening and
+            // closing the menu is a no-op (no mtime churn on the file).
+            System.out.println("[AutoGG] config unchanged (triggers=" + triggers
+                    + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms"
+                    + ") -- skipping save to avoid overwriting custom config.");
+        }
     }
 
     /** Vanilla screen that lets the user edit triggers / response / cooldown
