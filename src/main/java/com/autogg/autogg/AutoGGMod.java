@@ -1,28 +1,42 @@
 package com.autogg.autogg;
 
+import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.hud.ChatHud;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.widget.ButtonWidget;
+import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.text.Text;
+import org.lwjgl.glfw.GLFW;
 
+import java.io.File;
+import java.io.FileWriter;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
-public class AutoGGMod implements ModInitializer {
-    // Hardcoded chat-line substrings that auto-fire the response. Whatever the
-    // server prints, if any new line contains one of these (case-insensitive
-    // substring), we send "gg" through the player's network handler. No config
-    // file, no GUI, no keybind — edit this list and rebuild to change it.
-    private static final List<String> TRIGGERS = List.of(
+public class AutoGGMod implements ModInitializer, ClientModInitializer {
+    public static final String MOD_ID = "autogg";
+
+    private static final List<String> DEFAULT_TRIGGERS = List.of(
             "\uD83C\uDFC6",
             "Winner(s):",
             "First to:",
@@ -31,27 +45,50 @@ public class AutoGGMod implements ModInitializer {
             "Game Log",
             "Match Summary",
             "Game Over!");
-    private static final String RESPONSE = "gg";
-    // Minimum milliseconds between sends. A multi-line match summary can fire
-    // several triggers in the same network tick; this prevents a flood.
-    private static final long COOLDOWN_MS = 5000L;
+    private static final String DEFAULT_RESPONSE = "gg";
+    private static final long DEFAULT_COOLDOWN_MS = 5000L;
+
+    // Live config: populated from autogg.properties at startup, mutated by the
+    // in-game config screen, written back to disk on save.
+    private List<String> triggers = new ArrayList<>(DEFAULT_TRIGGERS);
+    private String responseMessage = DEFAULT_RESPONSE;
+    private long cooldownMs = DEFAULT_COOLDOWN_MS;
 
     // Identity-based set of ChatHudLine references we've already processed.
-    // ChatHud prepends new lines, so the newest is at index 0; walking from
-    // there forward and stopping at the first already-known reference bounds
-    // each tick to brand-new lines and avoids re-firing every tick on the
-    // visible backlog. Identity (not equals) is required because ChatHudLine
-    // records with the same content but different instances would otherwise
-    // be "equal" and we'd never advance knownRefs.
     private final Set<Object> knownRefs = Collections.newSetFromMap(new IdentityHashMap<>());
     private long lastFireTime = 0L;
-    // Tracked so we can skip our own server-echo of RESPONSE.
+    // Tracked so we can skip our own server-echo of responseMessage.
     private String lastSentText = "";
+
+    // Cached after first load/persist so the same file we read is written to.
+    private Path configFilePath = null;
+
+    private KeyBinding openConfigKey;
 
     @Override
     public void onInitialize() {
-        System.out.println("[AutoGG] loaded — watching chat, will send \"" + RESPONSE + "\" on trigger");
+        System.out.println("[AutoGG] onInitialize entered");
+        loadConfig();
         ClientTickEvents.START_WORLD_TICK.register(this::onTick);
+    }
+
+    @Override
+    public void onInitializeClient() {
+        // Default keybind F8 — non-conflicting with movement/chat/inventory.
+        // Remappable via Options -> Controls (MISC category).
+        openConfigKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.autogg.open_config",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_F8,
+                KeyBinding.Category.MISC));
+        // END_CLIENT_TICK fires every client tick (including on the title
+        // menu), so the user can open the screen anywhere.
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (openConfigKey == null) return;
+            while (openConfigKey.wasPressed()) {
+                client.setScreen(new AutoGGConfigScreen(client.currentScreen));
+            }
+        });
     }
 
     private void onTick(ClientWorld world) {
@@ -65,9 +102,6 @@ public class AutoGGMod implements ModInitializer {
             List<?> messages = findMessagesList(chatHud);
             if (messages == null) return;
 
-            // Walk from index 0 (newest) forward. Stop the moment we hit a ref
-            // we already know — anything before it (in 0..i-1) is freshly
-            // added by the chat HUD this tick.
             int size = messages.size();
             for (int i = 0; i < size; i++) {
                 Object line = messages.get(i);
@@ -77,20 +111,31 @@ public class AutoGGMod implements ModInitializer {
 
                 String text = extractText(line);
                 if (text.isEmpty()) continue;
-
-                // Server echoes our own sends as chat lines; suppress them.
                 if (isOurEcho(text)) {
                     lastSentText = "";
                     continue;
                 }
 
-                matchAndFire(mc, text);
+                String lower = text.toLowerCase(Locale.ROOT);
+                for (String trig : triggers) {
+                    if (lower.contains(trig.toLowerCase(Locale.ROOT))) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastFireTime >= cooldownMs) {
+                            if (send(mc, responseMessage)) {
+                                lastFireTime = now;
+                                lastSentText = responseMessage;
+                                System.out.println("[AutoGG] matched \"" + trig
+                                        + "\" -> sent \"" + responseMessage + "\"");
+                            }
+                        }
+                        break;
+                    }
+                }
             }
 
-            // Trim refs that scrolled out of the visible window so knownRefs
-            // doesn't grow without bound over a long session. Collect stale
-            // refs first, then removeAll, so we don't mutate knownRefs while
-            // iterating its entry set (avoids ConcurrentModificationException).
+            // Trim refs that scrolled out of the visible window. Collect stale
+            // refs first, then removeAll outside the iteration to avoid
+            // ConcurrentModificationException.
             Set<Object> current = Collections.newSetFromMap(new IdentityHashMap<>());
             for (Object line : messages) if (line != null) current.add(line);
             Set<Object> stale = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -98,23 +143,6 @@ public class AutoGGMod implements ModInitializer {
             knownRefs.removeAll(stale);
         } catch (Throwable ignored) {
             // never let a tick throw
-        }
-    }
-
-    private void matchAndFire(MinecraftClient mc, String text) {
-        String lower = text.toLowerCase(Locale.ROOT);
-        for (String trig : TRIGGERS) {
-            if (lower.contains(trig.toLowerCase(Locale.ROOT))) {
-                long now = System.currentTimeMillis();
-                if (now - lastFireTime >= COOLDOWN_MS) {
-                    if (send(mc, RESPONSE)) {
-                        lastFireTime = now;
-                        lastSentText = RESPONSE;
-                        System.out.println("[AutoGG] matched \"" + trig + "\" -> sent \"" + RESPONSE + "\"");
-                    }
-                }
-                return;
-            }
         }
     }
 
@@ -131,6 +159,201 @@ public class AutoGGMod implements ModInitializer {
         if (nh == null) return false;
         nh.sendChatMessage(msg);
         return true;
+    }
+
+    private void loadConfig() {
+        File cfg = resolveConfigFile();
+        try {
+            if (cfg.exists()) {
+                List<String> parsedTriggers = new ArrayList<>(DEFAULT_TRIGGERS);
+                String parsedResponse = DEFAULT_RESPONSE;
+                long parsedCooldown = DEFAULT_COOLDOWN_MS;
+                for (String raw : Files.readAllLines(cfg.toPath())) {
+                    String l = raw.trim();
+                    if (l.isEmpty() || l.startsWith("#")) continue;
+                    int eq = l.indexOf('=');
+                    if (eq <= 0) continue;
+                    String key = l.substring(0, eq).trim();
+                    String val = l.substring(eq + 1).trim();
+                    if ("triggers".equalsIgnoreCase(key)) {
+                        parsedTriggers.clear();
+                        for (String t : val.split(",")) {
+                            String tt = t.trim();
+                            if (!tt.isEmpty()) parsedTriggers.add(tt);
+                        }
+                    } else if ("response".equalsIgnoreCase(key)) {
+                        parsedResponse = val;
+                    } else if ("cooldownMs".equalsIgnoreCase(key)) {
+                        try { parsedCooldown = Long.parseLong(val); } catch (NumberFormatException nfe) { /* keep default */ }
+                    }
+                }
+                triggers = parsedTriggers;
+                responseMessage = parsedResponse;
+                cooldownMs = parsedCooldown;
+            } else {
+                // First run: write the defaults so the user can find/edit it.
+                persistConfig();
+            }
+        } catch (Throwable t) {
+            System.out.println("[AutoGG] config load failed: " + t);
+        }
+        System.out.println("[AutoGG] config loaded: triggers=" + triggers
+                + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms");
+    }
+
+    private void persistConfig() {
+        if (configFilePath == null) {
+            configFilePath = resolveConfigFile().toPath();
+        }
+        try {
+            File cfg = configFilePath.toFile();
+            File parent = cfg.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            try (FileWriter w = new FileWriter(cfg)) {
+                w.write("# AutoGG configuration\n");
+                w.write("# Edit in-game via the AutoGG config screen (default key: F8),\n");
+                w.write("# or here and restart / close + reopen the screen to apply.\n");
+                w.write("# Comma-separated substring patterns. A chat line matches if it\n");
+                w.write("# contains any of these (case-insensitive substring search).\n");
+                w.write("triggers=" + String.join(",", triggers) + "\n");
+                w.write("# Message the mod sends in chat when a trigger fires.\n");
+                w.write("response=" + responseMessage + "\n");
+                w.write("# Minimum milliseconds between sends to avoid spam.\n");
+                w.write("cooldownMs=" + cooldownMs + "\n");
+            }
+        } catch (Throwable t) {
+            System.out.println("[AutoGG] config save failed: " + t);
+        }
+    }
+
+    private File resolveConfigFile() {
+        try {
+            Path gameDir = FabricLoader.getInstance().getGameDir();
+            return gameDir.resolve("config").resolve("autogg.properties").toFile();
+        } catch (Throwable t) {
+            return new File("./config/autogg.properties");
+        }
+    }
+
+    /** Parse the raw text-field contents, replace in-memory config, persist.
+     *  Robust to bad input — fields fall back to defaults rather than throwing. */
+    void applyConfigFromText(String triggersText, String responseText, String cooldownText) {
+        List<String> parsed = new ArrayList<>();
+        if (triggersText != null) {
+            for (String t : triggersText.split(",")) {
+                String tt = t.trim();
+                if (!tt.isEmpty()) parsed.add(tt);
+            }
+        }
+        if (parsed.isEmpty()) parsed.addAll(DEFAULT_TRIGGERS);
+
+        long cd = DEFAULT_COOLDOWN_MS;
+        if (cooldownText != null) {
+            String trimmed = cooldownText.trim();
+            if (!trimmed.isEmpty()) {
+                try { cd = Long.parseLong(trimmed); } catch (NumberFormatException nfe) { /* keep default */ }
+            }
+        }
+        if (cd < 0) cd = 0L;
+
+        triggers = parsed;
+        responseMessage = (responseText == null || responseText.isEmpty()) ? DEFAULT_RESPONSE : responseText;
+        cooldownMs = cd;
+        // Reset transient state so a fresh response/cooldown take full effect.
+        lastSentText = "";
+        lastFireTime = 0L;
+        persistConfig();
+        System.out.println("[AutoGG] config updated via GUI: triggers=" + triggers
+                + ", response=\"" + responseMessage + "\", cooldown=" + cooldownMs + "ms");
+    }
+
+    /** Vanilla screen that lets the user edit triggers / response / cooldown
+     *  from in-game and writes the result back to the config file. Always
+     *  saves on ESC and on Done; partial edits fall back to defaults per
+     *  field via applyConfigFromText. */
+    class AutoGGConfigScreen extends Screen {
+        private final Screen parentScreen;
+        private TextFieldWidget triggersField;
+        private TextFieldWidget responseField;
+        private TextFieldWidget cooldownField;
+
+        AutoGGConfigScreen(Screen parent) {
+            super(Text.translatable("screen.autogg.title"));
+            this.parentScreen = parent;
+        }
+
+        @Override
+        protected void init() {
+            super.init();
+            int cx = this.width / 2;
+
+            triggersField = new TextFieldWidget(
+                    this.textRenderer, cx - 200, 60, 400, 20,
+                    Text.translatable("screen.autogg.triggers"));
+            triggersField.setMaxLength(1000);
+            triggersField.setText(String.join(",", AutoGGMod.this.triggers));
+            this.addDrawableChild(triggersField);
+
+            responseField = new TextFieldWidget(
+                    this.textRenderer, cx - 200, 110, 400, 20,
+                    Text.translatable("screen.autogg.response"));
+            responseField.setMaxLength(256);
+            responseField.setText(AutoGGMod.this.responseMessage);
+            this.addDrawableChild(responseField);
+
+            cooldownField = new TextFieldWidget(
+                    this.textRenderer, cx - 60, 160, 120, 20,
+                    Text.translatable("screen.autogg.cooldown"));
+            cooldownField.setMaxLength(12);
+            cooldownField.setText(String.valueOf(AutoGGMod.this.cooldownMs));
+            this.addDrawableChild(cooldownField);
+
+            this.addDrawableChild(ButtonWidget.builder(
+                    Text.translatable("gui.done"),
+                    btn -> saveFromFieldsAndClose())
+                    .dimensions(cx - 100, 210, 200, 20)
+                    .build());
+        }
+
+        private void saveFromFieldsAndClose() {
+            saveFromFields();
+            if (this.client != null) {
+                this.client.setScreen(this.parentScreen);
+            }
+        }
+
+        private void saveFromFields() {
+            AutoGGMod.this.applyConfigFromText(
+                    triggersField == null ? "" : triggersField.getText(),
+                    responseField == null ? "" : responseField.getText(),
+                    cooldownField == null ? "" : cooldownField.getText());
+        }
+
+        @Override
+        public void close() {
+            // Save even if the user presses ESC; otherwise closing without
+            // saving would silently discard the changes.
+            saveFromFields();
+            if (this.client != null) {
+                this.client.setScreen(this.parentScreen);
+            }
+        }
+
+        @Override
+        public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+            this.renderBackground(context, mouseX, mouseY, delta);
+            int cx = this.width / 2;
+            context.drawCenteredTextWithShadow(this.textRenderer, this.title, cx, 15, 0xFFFFFFFF);
+            context.drawTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.triggers_label"), cx - 200, 42, 0xFFA0A0A0);
+            context.drawTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.response_label"), cx - 200, 92, 0xFFA0A0A0);
+            context.drawTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.cooldown_label"), cx - 200, 142, 0xFFA0A0A0);
+            context.drawCenteredTextWithShadow(this.textRenderer,
+                    Text.translatable("screen.autogg.hint"), cx, 250, 0xFF808080);
+            super.render(context, mouseX, mouseY, delta);
+        }
     }
 
     /**

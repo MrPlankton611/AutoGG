@@ -1,12 +1,9 @@
 # AutoGG
 
 A small **Fabric** mod for **Minecraft 1.21.11** that watches the chat HUD on
-multiplayer servers. When a chat line contains any of a hardcoded set of
-trigger substrings (trophy `🏆`, `Winner(s):`, `Match Report`, etc.), the
-mod sends `gg` once per cooldown window and stops.
-
-That's the whole mod. There is no config file, no in-game menu, no keybind,
-and no settings UI — it only cares about the chat log.
+multiplayer servers and sends a chat message (default `gg`) once per cooldown
+window when a chat line contains any of the configured trigger substrings
+(default: trophy `🏆`, `Winner(s):`, `Match Report`, etc.).
 
 - Mod id: `autogg`
 - Version: `1.0.0`
@@ -46,8 +43,44 @@ If any trigger matches, the mod sends `gg` through the player's network
 handler and waits 5 seconds before being willing to send again (so a
 multi-line match summary doesn't fire `gg` five times in a row).
 
-To change the triggers or the response message, edit the `TRIGGERS` and
-`RESPONSE` constants in `AutoGGMod.java` and rebuild.
+## Configure
+
+The mod ships with hardcoded defaults, but reads `<gameDir>/config/autogg.properties`
+on startup if it exists. On first launch it writes a default file so you can
+edit it (or use the in-game screen) right away.
+
+```properties
+# Comma-separated substring patterns. A chat line matches if it contains any
+# of these (case-insensitive substring search).
+triggers=🏆,Winner(s):,First to:,Match Report,Match Log,Game Log,Match Summary,Game Over!
+
+# Chat message the mod sends when a trigger fires.
+response=gg
+
+# Minimum milliseconds between sends to avoid spam.
+cooldownMs=5000
+```
+
+Lines beginning with `#` are comments. Blank lines are ignored. Bad numeric
+values for `cooldownMs` fall back to the default (5000).
+
+### Configure in-game
+
+Press **F8** (default keybind) to open the AutoGG config screen from anywhere
+in the client — main menu, singleplayer, options screen, or in-game. The
+screen has three fields:
+
+- **Triggers** — comma-separated substring patterns (same format as the file).
+- **Response** — the chat message the mod sends when a trigger fires.
+- **Cooldown (ms)** — minimum milliseconds between sends.
+
+Changes save automatically when you close the screen (Done button or ESC)
+and are written back to `<gameDir>/config/autogg.properties` immediately, so
+you can also edit the file by hand and pick up the new values on the next
+screen-open or restart.
+
+The keybind can be remapped in **Options → Controls** under the **Misc**
+category; it has the translation key `key.autogg.open_config`.
 
 ## How the chat HUD is read
 
@@ -103,9 +136,10 @@ works without the `CMD_LINE_ARGS` workaround.
 
 ## Troubleshooting
 
-- **Nothing fires on a clear match-end line** — the trigger list is hardcoded
-  in `AutoGGMod.java`. If the server's match message uses a phrase that
-  isn't in the list, no match will fire. Edit the source and rebuild.
+- **Nothing fires on a clear match-end line** — open the F8 config screen and
+  confirm the trigger list contains the phrase the server prints. Adding a
+  substring in the **Triggers** field and closing the screen is enough; no
+  restart required.
 - **Triggers fire twice** — they shouldn't. There's a 5-second cooldown, and
   the server echo of `gg` is dropped by the self-echo guard.
 - **Build fails with `CMD_LINE_ARGS`** — use the cached Gradle 9.6 direct
@@ -115,10 +149,10 @@ works without the `CMD_LINE_ARGS` workaround.
 ## Project layout
 
 ```
-src/main/java/com/autogg/autogg/AutoGGMod.java   single-file mod
+src/main/java/com/autogg/autogg/AutoGGMod.java   single-file mod, includes the in-game AutoGGConfigScreen
 src/main/resources/
-    assets/autogg/lang/en_us.json                (empty key set, no UI)
-    fabric.mod.json                              mod metadata
+    assets/autogg/lang/en_us.json                keybinding + config screen strings
+    fabric.mod.json                              mod metadata (main + client entrypoints)
 build.gradle                                     Loom build script
 gradle.properties                                pinned MC / Fabric / Java versions
 ```

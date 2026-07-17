@@ -15,6 +15,9 @@
     "entrypoints": {
         "main": [
             "com.autogg.autogg.AutoGGMod"
+        ],
+        "client": [
+            "com.autogg.autogg.AutoGGMod"
         ]
     },
     "depends": {
