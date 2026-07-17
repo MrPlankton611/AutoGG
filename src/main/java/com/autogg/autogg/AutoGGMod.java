@@ -17,8 +17,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
+import java.util.UUID;
 
 public class AutoGGMod implements ModInitializer {
     public static final String MOD_ID = "autogg";
@@ -32,9 +35,25 @@ public class AutoGGMod implements ModInitializer {
     private long cooldownMs = DEFAULT_COOLDOWN_MS;
 
     private boolean primed = false;
-    private int lastChatSize = 0;
+    // Identity-based set of ChatHudLine element references we've already processed.
+    // Minecraft's ChatHud prepends via `messages.add(0, ...)` so newest lines are at
+    // index 0; scanning from 0 forward and stopping at the first already-known ref
+    // works regardless of prepend/append. Tracking references (not size) also handles
+    // the chat-buffer cap plateau: when size is pinned at 100, new prepended lines
+    // still bump the front and the IdentityHashMap sees them as new.
+    private final Set<Object> knownRefs = Collections.newSetFromMap(new IdentityHashMap<>());
+    // Defensive cap; in practice the trim keeps us well under this.
+    private static final int MAX_KNOWN_REFS = 256;
     private long lastFireTime = 0L;
     private String lastSentText = "";
+
+    // Cached values used to detect world / player swap and reset knownRefs+list choice.
+    private List<?> cachedMessagesList = null;
+    private UUID lastPlayerUuid = null;
+
+    // Rate-limit for the "scanned, no matching trigger" diagnostic so it doesn't spam.
+    private long lastScanLogMs = 0L;
+    private static final long SCAN_LOG_INTERVAL_MS = 10_000L;
 
     private static boolean visitorClassResolved = false;
     private static Class<?> characterVisitorClass = null;
@@ -52,32 +71,63 @@ public class AutoGGMod implements ModInitializer {
                 ChatHud chatHud = (mc.inGameHud == null) ? null : mc.inGameHud.getChatHud();
                 if (chatHud == null) return;
 
-                List<?> messages = findMessagesList(chatHud);
+                List<?> messages = getMessagesList(chatHud);
+                if (messages == null) return;
+
+                // World / player change detection: clear all state so the new chat hud
+                // doesn't fire on already-displayed backlog from the previous session.
+                UUID currentUuid = mc.player.getUuid();
+                if (lastPlayerUuid != null && !lastPlayerUuid.equals(currentUuid)) {
+                    primed = false;
+                    knownRefs.clear();
+                    cachedMessagesList = null;
+                    System.out.println("[AutoGG] player changed; resetting chat watcher");
+                }
+                lastPlayerUuid = currentUuid;
+
                 if (!primed) {
                     primed = true;
-                    lastChatSize = (messages == null) ? 0 : messages.size();
-                    System.out.println("[AutoGG] chat polling started; " + (messages == null ? "no list yet, will retry" : messages.size() + " lines buffered"));
-                    return;
-                }
-                if (messages == null) return;
-                int size = messages.size();
-                if (size <= lastChatSize) {
-                    lastChatSize = size;
+                    knownRefs.clear();
+                    for (Object line : messages) {
+                        if (line != null) knownRefs.add(line);
+                    }
+                    System.out.println("[AutoGG] chat polling started; " + messages.size() + " lines buffered");
                     return;
                 }
 
-                int since = lastChatSize;
-                lastChatSize = size;
-                for (int i = since; i < size; i++) {
+                int size = messages.size();
+
+                // Defensive cap to bound knownRefs regardless of whether the trim path
+                // was reached (e.g. if newCount > 0 logic ever regresses).
+                if (knownRefs.size() > MAX_KNOWN_REFS) {
+                    knownRefs.clear();
+                    for (Object line : messages) {
+                        if (line != null) knownRefs.add(line);
+                    }
+                }
+
+                // Walk from the front (newest = index 0 due to ChatHud's prepend).
+                // Stop the moment we hit a reference that's already in knownRefs.
+                int newCount = 0;
+                int firedCount = 0;
+                for (int i = 0; i < size; i++) {
                     Object line = messages.get(i);
+                    if (line == null) continue;
+                    if (knownRefs.contains(line)) {
+                        // From here on, all refs were in the previous frame. Anything
+                        // before this index (0..i-1) is freshly added.
+                        break;
+                    }
+
+                    knownRefs.add(line);
+                    newCount++;
+
                     String text = extractText(line);
-                    if (text == null || text.isEmpty()) continue;
+                    if (text.isEmpty()) continue;
 
                     // Self-loop guard: server typically echoes our send as a chat line.
-                    // Skip if the new line is exactly our send, or ends with " <our-send>".
-                    // (Substring containment was too greedy — would suppress "Winner(s): gg").
                     if (isOurEcho(text)) {
-                        lastSentText = ""; // consumed; don't suppress further legitimate lines
+                        lastSentText = ""; // consumed; don't suppress later lines
                         continue;
                     }
 
@@ -90,9 +140,37 @@ public class AutoGGMod implements ModInitializer {
                                 System.out.println("[AutoGG] matched '" + trig + "' -> sent '" + responseMessage + "'");
                                 lastFireTime = now;
                                 lastSentText = responseMessage;
+                                firedCount++;
                             }
                             break;
                         }
+                    }
+                }
+
+                // Trim knownRefs to the currently-visible window whenever anything
+                // changed. Amortized: only on ticks where new lines actually arrived.
+                // IMPORTANT: membership test must be identity-based. List.contains
+                // calls .equals(), and ChatHudLine/MessagePair records with the same
+                // content but different instances would be considered equal -- exactly
+                // the bug class that the whole tracking scheme is meant to avoid.
+                if (newCount > 0) {
+                    Set<Object> currentSet = Collections.newSetFromMap(new IdentityHashMap<>());
+                    for (Object line : messages) {
+                        if (line != null) currentSet.add(line);
+                    }
+                    Set<Object> stale = null;
+                    for (Object line : knownRefs) {
+                        if (!currentSet.contains(line)) {
+                            if (stale == null) stale = Collections.newSetFromMap(new IdentityHashMap<>());
+                            stale.add(line);
+                        }
+                    }
+                    if (stale != null) knownRefs.removeAll(stale);
+
+                    long now = System.currentTimeMillis();
+                    if (firedCount == 0 && now - lastScanLogMs >= SCAN_LOG_INTERVAL_MS) {
+                        System.out.println("[AutoGG] " + newCount + " new chat line(s) scanned, no matching trigger");
+                        lastScanLogMs = now;
                     }
                 }
             } catch (Throwable ignored) {
@@ -110,13 +188,23 @@ public class AutoGGMod implements ModInitializer {
     }
 
     /**
-     * Pick the chat messages list on the runtime ChatHud. Yarn 1.21.11 ChatHud has more
-     * than one List field (visible `messages`, `trimmedMessages` (List<MessagePair>),
-     * sent-message history). Both ChatHudLine and MessagePair expose a no-arg
-     * `content()` method, so any pure signature-based selector can pick the wrong
-     * list. We empirically pick whichever list's first non-null element yields a
-     * non-empty text via `extractText(...)`. That selects only the list whose
-     * elements are ChatHudLine (or otherwise readable).
+     * Return the chat-hud messages list, caching the chosen field once we've picked
+     * one. Yarn 1.21.11 ChatHud has multiple List fields (`messages`, trimmedMessages,
+     * sent-message history); iterating getDeclaredFields() each tick isn't stable in
+     * order, so without caching we might pick a different list on a later tick and
+     * see all references as "new", causing spurious re-fires.
+     */
+    private List<?> getMessagesList(ChatHud chatHud) {
+        if (cachedMessagesList == null) {
+            cachedMessagesList = findMessagesList(chatHud);
+        }
+        return cachedMessagesList;
+    }
+
+    /**
+     * Pick the chat messages list on the runtime ChatHud. Iterate declared List fields
+     * and return the first that produces non-empty text via `extractText(...)`. Only
+     * the first successful pick is used thereafter (see {@link #getMessagesList}).
      */
     private static List<?> findMessagesList(ChatHud chatHud) {
         try {
@@ -127,12 +215,10 @@ public class AutoGGMod implements ModInitializer {
                 Object v = f.get(chatHud);
                 if (!(v instanceof List<?>)) continue;
                 List<?> list = (List<?>) v;
-                // Test that at least one element produces a non-empty text via our
-                // normalizer. That empirically identifies readable chat lines.
                 for (Object element : list) {
                     if (element == null) continue;
                     String s = extractText(element);
-                    if (s != null && !s.isEmpty()) return list;
+                    if (!s.isEmpty()) return list;
                 }
             }
         } catch (Throwable ignored) {
@@ -144,10 +230,11 @@ public class AutoGGMod implements ModInitializer {
     /**
      * ChatHudLine.content() returns an OrderedText in Yarn 1.21.11. Try Text#getString()
      * first, fall back to walking OrderedText via a CharacterVisitor proxy that
-     * accumulates code points. Last resort: toString().
+     * accumulates code points. Last resort: toString(). Always returns a non-null
+     * String; callers can use {@code text.isEmpty()} to skip blank lines.
      */
     private static String extractText(Object line) {
-        if (line == null) return null;
+        if (line == null) return "";
         Object ord = null;
         try {
             Method m = line.getClass().getMethod("content");
